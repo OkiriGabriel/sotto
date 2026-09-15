@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 
 import react from "@vitejs/plugin-react";
@@ -360,8 +361,34 @@ const apiProxy = {
   "/community": api,
 };
 
+// Mirror the Caddyfile's trailing-slash fold for the six guide slugs so `vite preview`
+// (the funnel suite, and anyone previewing a production build) does not serve the homepage
+// snapshot at `/<slug>/`. Keep the slug list sourced from `guidePages`, same as the files
+// the build emits.
+function guideSlashRedirectPlugin(): Plugin {
+  const slugs = new Set(guidePages.map((page) => page.slug));
+  function redirect(req: IncomingMessage, res: ServerResponse, next: () => void): void {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const match = /^\/([^/]+)\/$/.exec(url.pathname);
+    if (match !== null && slugs.has(match[1])) {
+      res.statusCode = 301;
+      res.setHeader("Location", `/${match[1]}${url.search}`);
+      res.end();
+      return;
+    }
+    next();
+  }
+  return {
+    name: "sotto-guide-slash-redirect",
+    configurePreviewServer(server) {
+      // Register before Vite's HTML fallback so `/<slug>/` never becomes index.html.
+      server.middlewares.use(redirect);
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), cspPlugin(), sriPlugin(), seoPrerenderPlugin()],
+  plugins: [react(), cspPlugin(), sriPlugin(), seoPrerenderPlugin(), guideSlashRedirectPlugin()],
   build: { target: "es2022" },
   server: { proxy: apiProxy },
   // Same proxy for `vite preview` (the built production bundle, not dev-server HMR) - the funnel
