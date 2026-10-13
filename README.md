@@ -1,5 +1,13 @@
 [English](README.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português (BR)](README.pt-BR.md)
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="web/public/mark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="web/public/mark-light.svg">
+    <img src="web/public/mark-dark.svg" alt="Sotto" width="64" height="64">
+  </picture>
+</p>
+
 # Sotto
 
 End-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
@@ -51,12 +59,15 @@ Windows). Prefer to look first? Grab an archive from the
 
 ```sh
 # bash
+mkdir -p ~/.local/share/bash-completion/completions
 sotto completions bash > ~/.local/share/bash-completion/completions/sotto
 
 # zsh (add the directory to fpath in ~/.zshrc first)
+mkdir -p ~/.zfunc
 sotto completions zsh > ~/.zfunc/_sotto
 
 # fish
+mkdir -p ~/.config/fish/completions
 sotto completions fish > ~/.config/fish/completions/sotto.fish
 ```
 
@@ -75,18 +86,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: getsotto/sotto-action@543d1af56ac81d1f1511d88c3d269106e8513a28 # merged v1.1 implementation
+      - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.4.0
+          sotto-version: v0.9.0
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
           SOTTO_TOKEN: ${{ secrets.SOTTO_TOKEN }}
 ```
 
-The action ref and `sotto-version` are independent. The example pins the merged v1.1 implementation
-by full commit SHA because a numbered action release has not yet been published. Keep
-`sotto-version` as an exact `vX.Y.Z` release. Set the optional `SOTTO_SERVER` repository variable
+The action ref and `sotto-version` are independent. Keep `sotto-version` as an exact `vX.Y.Z`
+release. Set the optional `SOTTO_SERVER` repository variable
 for a self-hosted server. See the [action documentation](https://github.com/getsotto/sotto-action#readme)
 for matrix, Windows, and reusable-workflow examples.
 
@@ -104,8 +114,24 @@ sotto import .env            # optional: pull in an existing file, still encrypt
 sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
-sotto share DATABASE_URL     # one-time, burn-after-reading link for a single secret
+sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
+
+In an interactive terminal, each omitted share limit opens its own menu. The view menu offers
+1, 2, 3, 5 or 10 views and a custom value; the lifetime menu offers no expiry, 1 hour, 1 day,
+7 days, 30 days or a custom number of seconds. Custom values must be 1-100 views or
+1-2592000 seconds. Supplying `DATABASE_URL` skips secret selection only: `--views` skips the view
+menu and `--expire` skips the lifetime menu independently. Press Esc or Ctrl-C in any selection
+menu to cancel without creating a share.
+
+Non-interactive use requires an explicit secret name. When either limit flag is omitted there,
+its existing default applies: one view and no expiry. To bypass all three selection menus in an
+interactive terminal, supply the name and both limits, for example
+`sotto share DATABASE_URL --views 3 --expire 3600`. Unlock and passphrase prompts may still apply.
+
+To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
 
 Use `--env` to select an environment for one command without changing the project's default:
 
@@ -117,6 +143,10 @@ sotto ls --env staging
 `--env` lasts for that command only; `sotto env use` changes the default.
 
 Export writes plaintext, so it needs `--reveal` on a terminal, just like `sotto get`.
+Use `sotto share --no-copy` to disable interactive copying, or `--copy` to request it explicitly.
+These flags control the clipboard only; `--no-copy` does not skip the share limit menus.
+Clipboard clearing is best-effort: replacing the clipboard protects the newer content, while
+clipboard managers, suspension, or a terminated helper may retain a history copy.
 
 `sotto login` uses the hosted instance at [getsotto.co.uk](https://getsotto.co.uk) unless you point
 it elsewhere with `--server <url>` (see [Deploying](deploy/README.md) to run your own). Either way
@@ -132,6 +162,121 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
 sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
+
+Machine tokens expire. A new token lasts 90 days unless you pass `--expires-in-days` with anything
+from 1 to 365, and `sotto token ls` shows when each one ends. Two weeks before that, `sotto run` and
+`sotto export` print a warning in the CI log. To replace a token, create a new one, update the CI
+secret, then revoke the old one with `sotto token revoke`.
+
+### Cloud status
+
+To inspect the configured server and your account's Cloud eligibility, first log in:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+The command needs an active login but does not unlock the local vault or open a browser. It reports the configured `server`, the server's `server_info`, the account `eligibility`, and a `billing_url` only when the returned state says billing is available. The human-readable output also shows `actions`, `next_actions`, and any optional `paid_through_epoch`, `recovery_until_epoch`, or `export_until_epoch` values. A missing `server_info` or `eligibility` means that an older server does not expose that endpoint; it is not proof that access is allowed or denied.
+
+The JSON form is useful for scripts. Its top-level shape is:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
+
+### Interactive dashboard
+
+From an initialised project, run `sotto` without a subcommand to browse its local secrets:
+
+```sh
+sotto
+```
+
+A local identity must exist and be unlocked before the dashboard opens. Sotto prompts for the
+master password when needed. The dashboard requires terminals on stdin, stdout, and stderr.
+If one is missing, CI is active, or `TERM=dumb`, a bare invocation writes help to stderr and exits
+with code 2.
+Use `sotto --help` to request help explicitly.
+
+Use the arrow keys or `j` and `k` to navigate. Press `/` to search, `?` for help, and Tab to switch
+environments. This switch lasts only for the dashboard session; `sotto env use` changes the
+project's default. Press `r` to reveal or conceal the selected value, `c` to copy it to the
+clipboard, and `q` to quit. `Esc` closes the current search or dialog; from the main view, it
+clears an active search or quits.
+
+Press `t` to browse themes with a live preview. Use the arrow keys to preview each theme, then
+press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)
+explain how command and environment overrides affect the saved preference.
+
+### Output themes
+
+The CLI ships five built-in themes: `nord` (the default), `sordino`, `terminal`, `monochrome`,
+and `tokyo-night`. Manage them with `sotto theme`:
+
+```sh
+sotto theme ls        # list available themes; the active one is marked
+sotto theme set nord  # save a preference for later commands
+sotto theme current   # print the theme this shell resolves to
+```
+
+`--theme <name>` picks a theme for one command. `SOTTO_THEME` sets it for a shell, and
+`sotto theme set` saves it. Precedence is `--theme`, then `SOTTO_THEME`, then the saved
+preference, then `nord`; an unknown name warns on standard error and falls back to `nord`.
+
+Styling applies to interactive terminals only. `--plain`, a non-empty `NO_COLOR` (the
+[no-color.org](https://no-color.org) contract), CI environments, piped standard output, and
+redirected standard input each suppress colour and decoration while keeping the selected
+palette, so scripts and logs read plain text.
+
+Custom themes are TOML files in the `themes` directory inside your platform data directory:
+`~/Library/Application Support/sotto` on macOS, `%APPDATA%\sotto` on Windows, and
+`$XDG_DATA_HOME/sotto` or `~/.local/share/sotto` on Linux (`SOTTO_DATA_DIR` moves that
+directory). Each `*.toml` file needs the tokens below and takes its name from a `name` field,
+or from the filename when the field is absent; a file that fails to parse is skipped. Colours
+accept hex values, ANSI colour names, `ansi(<index>)` indices, and `default`.
+
+```toml
+bg = "#120024"
+fg = "#ffffff"
+accent = "#ff007f"
+success = "#00ff66"
+warning = "#ffaa00"
+error = "#ff0033"
+muted = "#775588"
+border = "#331144"
+```
+
+Saved as `synth.toml`, that file adds a `synth` theme. Apply it with `sotto theme set synth`,
+or for one command with `sotto --theme synth <command>`.
 
 ### Another device
 

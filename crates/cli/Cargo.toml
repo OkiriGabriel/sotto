@@ -21,6 +21,7 @@ toml.workspace = true
 rusqlite.workspace = true
 uuid.workspace = true
 sotto-core.workspace = true
+sha2.workspace = true
 zeroize.workspace = true
 # Linux uses the pure-Rust (zbus) Secret Service backend rather than `sync-secret-service`,
 # which links the system C library libdbus-1 and would require libdbus-1-dev on every Linux
@@ -43,6 +44,13 @@ reqwest = { version = "0.12", default-features = false, features = [
     "native-tls",
 ] }
 base64 = "0.22"
+# Constant-time CSRF comparison for the loopback callback (S-10).
+subtle = "2"
+indicatif.workspace = true
+arboard.workspace = true
+inquire.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
@@ -54,3 +62,8 @@ sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "postgres",
 ] }
+
+# Spinner tests need a pseudo terminal to make the child's streams interactive; the `term`
+# feature carries `nix::pty` (openpty) and termios. Unix only: Windows has no openpty.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", features = ["term"] }

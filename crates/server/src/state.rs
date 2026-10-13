@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 use crate::auth::OAuthProvider;
 use crate::billing::BillingState;
-use crate::config::OAuthConfig;
+use crate::config::{DeploymentMode, OAuthConfig};
 
 /// Cloneable handle to the resources every request needs.
 ///
@@ -15,6 +15,7 @@ use crate::config::OAuthConfig;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    pub deployment_mode: DeploymentMode,
     pub oauth: Option<Arc<dyn OAuthProvider>>,
     pub oauth_config: Option<OAuthConfig>,
     pub billing: Option<BillingState>,
@@ -32,4 +33,8 @@ pub struct AppState {
     pub organisation_deletion_metrics_token: Option<String>,
     /// Bearer token for the protected operator-observation endpoint.
     pub organisation_deletion_operator_token: Option<String>,
+    /// Whether the dormant human hosted action policy rejects ineligible requests.
+    pub cloud_action_enforcement_enabled: bool,
+    /// Whether hosted machine retrieval and creation apply the accountable beneficiary policy.
+    pub machine_eligibility_enforcement_enabled: bool,
 }

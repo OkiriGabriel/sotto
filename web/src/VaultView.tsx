@@ -53,6 +53,7 @@ interface OpenEnv {
   secrets: NamedSecret[];
 }
 interface Revealed {
+  id: string;
   name: string;
   value: string;
   link: string | null;
@@ -81,10 +82,17 @@ export function VaultView({
   onLogout: () => void;
 }) {
   const [projects, setProjects] = useState<NamedProject[] | null>(null);
+  const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
   const [activeProject, setActiveProject] = useState<NamedProject | null>(null);
   const [envs, setEnvs] = useState<NamedEnv[] | null>(null);
   const [openEnv, setOpenEnv] = useState<OpenEnv | null>(null);
+  const [loadingEnvId, setLoadingEnvId] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<Revealed | null>(null);
+  const [copyBusy, setCopyBusy] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  const copyGeneration = useRef(0);
+  const [secretQuery, setSecretQuery] = useState("");
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
   const [shareTo, setShareTo] = useState("");
@@ -96,21 +104,52 @@ export function VaultView({
   const [error, setError] = useState<string | null>(null);
   const [rotatingEnvId, setRotatingEnvId] = useState<string | null>(null);
   const rotatingEnvRef = useRef<string | null>(null);
+  const [sharingEnvId, setSharingEnvId] = useState<string | null>(null);
+  const sharingEnvRef = useRef<string | null>(null);
+  const [creatingShare, setCreatingShare] = useState(false);
+  const creatingShareRef = useRef(false);
   // Selection loads can resolve out of order; only the latest generation may update the view.
   const projectLoad = useRef(0);
   const envLoad = useRef(0);
+  const revealGeneration = useRef(0);
+  const secretButtons = useRef(new Map<string, HTMLButtonElement>());
 
   /// The name-decryption key for a project: its org key when we hold one, else the master key.
   function nameKeyFor(orgId: string | null): Uint8Array {
     return (orgId !== null ? orgKeys.get(orgId) : undefined) ?? master;
   }
 
+  async function loadProjects(keys: Map<string, Uint8Array>) {
+    setProjectsLoading(true);
+    setProjectsError(null);
+    try {
+      const rows = await fetchProjects();
+      setProjects(
+        rows
+          .map((project) => {
+            const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
+            return {
+              project,
+              name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
+            };
+          })
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      );
+    } catch (e) {
+      setProjects([]);
+      setProjectsError(message(e));
+    } finally {
+      setProjectsLoading(false);
+    }
+  }
+
   useEffect(() => {
     void (async () => {
+      // Organisation discovery is optional for personal projects. Keep it isolated so
+      // a failure does not prevent the independent project request.
+      const keys = new Map<string, Uint8Array>();
+      const roles = new Map<string, string>();
       try {
-        // Open every org key we hold first, so org project names decrypt on first paint.
-        const keys = new Map<string, Uint8Array>();
-        const roles = new Map<string, string>();
         for (const org of await fetchOrgs()) {
           roles.set(org.id, org.role);
           if (org.encOrgKey !== null) {
@@ -121,34 +160,27 @@ export function VaultView({
             }
           }
         }
-        setOrgKeys(keys);
-        setOrgRoles(roles);
-
-        const rows = await fetchProjects();
-        setProjects(
-          rows.map((project) => {
-            const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
-            return {
-              project,
-              name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
-            };
-          }),
-        );
       } catch (e) {
-        setError(message(e));
+        setError(`organisations unavailable: ${message(e)}`);
       }
+      setOrgKeys(keys);
+      setOrgRoles(roles);
+
+      await loadProjects(keys);
     })();
   }, [master, encPrivateKeys]);
 
   async function selectProject(np: NamedProject) {
     const load = ++projectLoad.current;
     ++envLoad.current; // a project switch also invalidates any in-flight environment load
+    setLoadingEnvId(null);
     setError(null);
     setNotice(null);
     setActiveProject(np);
     setEnvs(null);
     setOpenEnv(null);
     setRevealed(null);
+    setSecretQuery("");
     setMembers(null);
     setShareTo(""); // drop a stale member pick so the next env's Share button starts disabled
     try {
@@ -158,7 +190,9 @@ export function VaultView({
         return;
       }
       setEnvs(
-        rows.map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) })),
+        rows
+          .map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
       );
     } catch (e) {
       if (load !== projectLoad.current) {
@@ -170,10 +204,12 @@ export function VaultView({
 
   async function selectEnv(ne: NamedEnv) {
     const load = ++envLoad.current;
+    setLoadingEnvId(ne.env.id);
     setError(null);
     setNotice(null);
     setOpenEnv(null);
     setRevealed(null);
+    setSecretQuery("");
     setMembers(null);
     setShareTo(""); // the new env reloads its own members; don't carry a stale pick across
     try {
@@ -185,6 +221,7 @@ export function VaultView({
       }
       if (grant === null) {
         setError("you have no key for this environment - ask an admin to share it with you");
+        setLoadingEnvId(null);
         return;
       }
       const vaultKey = openEnvGrant(master, encPrivateKeys, grant);
@@ -200,6 +237,7 @@ export function VaultView({
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
       setOpenEnv({ envId: ne.env.id, vaultKey, secrets });
+      setLoadingEnvId(null);
       // Org project: load the member list so the env can be shared from here.
       const orgId = activeProject?.project.orgId;
       if (orgId) {
@@ -214,12 +252,16 @@ export function VaultView({
         return;
       }
       setError(message(e));
+      setLoadingEnvId(null);
     }
   }
 
   /// Share the open environment with an org member: seal its vault key to their public key.
   async function shareWithMember() {
     if (openEnv === null || members === null) {
+      return;
+    }
+    if (sharingEnvRef.current === openEnv.envId) {
       return;
     }
     setError(null);
@@ -233,6 +275,15 @@ export function VaultView({
       setError("that member has no account keys yet - they must finish setup first");
       return;
     }
+    const envId = openEnv.envId;
+    // Capture the selection generation so a late response cannot paint a notice or error
+    // after the user has already switched environment or project.
+    const shareEnvLoad = envLoad.current;
+    const shareProjectLoad = projectLoad.current;
+    const shareStillCurrent = () =>
+      shareEnvLoad === envLoad.current && shareProjectLoad === projectLoad.current;
+    sharingEnvRef.current = envId;
+    setSharingEnvId(envId);
     try {
       const sealed = sealGrantTo(member.publicKey, openEnv.vaultKey);
       await createGrant(openEnv.envId, member.userId, sealed);
@@ -248,9 +299,20 @@ export function VaultView({
           // Best-effort only; the member may just see the org id for names.
         }
       }
+      if (!shareStillCurrent()) {
+        return;
+      }
       setNotice(`shared this environment with ${member.userId}`);
     } catch (e) {
+      if (!shareStillCurrent()) {
+        return;
+      }
       setError(message(e));
+    } finally {
+      if (sharingEnvRef.current === envId) {
+        sharingEnvRef.current = null;
+      }
+      setSharingEnvId((current) => (current === envId ? null : current));
     }
   }
 
@@ -261,6 +323,8 @@ export function VaultView({
       return;
     }
     const envId = openEnv.envId;
+    const selectionGeneration = envLoad.current;
+    const selectionIsCurrent = () => selectionGeneration === envLoad.current;
     rotatingEnvRef.current = envId;
     setRotatingEnvId(envId);
     setError(null);
@@ -276,7 +340,9 @@ export function VaultView({
           throw new Error("this environment is not in an organisation; nothing to rotate");
         }
         roster = await fetchMembers(orgId);
-        setMembers(roster);
+        if (selectionIsCurrent()) {
+          setMembers(roster);
+        }
       }
       const newKey = crypto.getRandomValues(new Uint8Array(32));
       const snap = await fetchSnapshot(openEnv.envId);
@@ -308,14 +374,24 @@ export function VaultView({
         machineGrants,
         historyKeys,
       });
-      setNotice("environment key rotated");
-      // Reload the environment under the new key (fetches the re-sealed grant).
-      const current = envs?.find((e) => e.env.id === openEnv.envId);
-      if (current !== undefined) {
-        await selectEnv(current);
+      if (selectionIsCurrent()) {
+        // Reload the environment under the new key (fetches the re-sealed grant).
+        const current = envs?.find((e) => e.env.id === envId);
+        if (current !== undefined) {
+          await selectEnv(current);
+          // selectEnv clears transient notices before reloading. Only restore the rotation
+          // success after that reload if no newer selection superseded it.
+          if (envLoad.current === selectionGeneration + 1) {
+            setNotice("environment key rotated");
+          }
+        } else {
+          setNotice("environment key rotated");
+        }
       }
     } catch (e) {
-      setError(message(e));
+      if (selectionIsCurrent()) {
+        setError(message(e));
+      }
     } finally {
       if (rotatingEnvRef.current === envId) {
         rotatingEnvRef.current = null;
@@ -329,24 +405,85 @@ export function VaultView({
     if (openEnv === null) {
       return;
     }
+    ++copyGeneration.current;
+    setCopyBusy(false);
+    setCopyFeedback(null);
     setError(null);
     try {
       const value = decryptSecretValue(openEnv.vaultKey, openEnv.envId, ns.entry);
-      setRevealed({ name: ns.name, value, link: null });
+      ++revealGeneration.current;
+      setRevealed({ id: ns.entry.id, name: ns.name, value, link: null });
     } catch (e) {
       setError(message(e));
     }
   }
 
+  async function copySecret(current: Revealed) {
+    if (copyBusy) return;
+    const generation = ++copyGeneration.current;
+    setCopyBusy(true);
+    setCopyFeedback(null);
+    try {
+      if (navigator.clipboard?.writeText === undefined) {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText(current.value);
+      if (generation === copyGeneration.current) setCopyFeedback("Secret copied.");
+    } catch {
+      if (generation === copyGeneration.current) {
+        setCopyFeedback("Copy failed. Select the value above and copy it manually.");
+      }
+    } finally {
+      if (generation === copyGeneration.current) setCopyBusy(false);
+    }
+  }
+
   async function share(current: Revealed) {
+    if (creatingShareRef.current) {
+      return;
+    }
+    creatingShareRef.current = true;
+    setCreatingShare(true);
+    setError(null);
+    const generation = revealGeneration.current;
     try {
       const { encBlob, fragmentKey } = sealForShare(current.value);
       const token = await createShare(encBlob, 1);
+      if (generation !== revealGeneration.current) {
+        return;
+      }
       const link = `${window.location.origin}/s/${token}#${bytesToUrlSafeB64(fragmentKey)}`;
       setRevealed({ ...current, link });
     } catch (e) {
-      setError(message(e));
+      if (generation === revealGeneration.current) {
+        setError(message(e));
+      }
+    } finally {
+      creatingShareRef.current = false;
+      setCreatingShare(false);
     }
+  }
+
+  const normalizedSecretQuery = secretQuery.trim().toLocaleLowerCase();
+  const filteredSecrets =
+    openEnv?.secrets.filter((secret) =>
+      secret.name.toLocaleLowerCase().includes(normalizedSecretQuery),
+    ) ?? [];
+  const secretSearchStatus =
+    normalizedSecretQuery === ""
+      ? `${filteredSecrets.length} secret ${filteredSecrets.length === 1 ? "name" : "names"} available.`
+      : filteredSecrets.length === 0
+        ? "No secret names match this search."
+        : `${filteredSecrets.length} secret ${filteredSecrets.length === 1 ? "name matches" : "names match"} this search.`;
+
+  function hideRevealed() {
+    if (revealed === null) {
+      return;
+    }
+    const id = revealed.id;
+    ++revealGeneration.current;
+    setRevealed(null);
+    secretButtons.current.get(id)?.focus();
   }
 
   return (
@@ -357,15 +494,30 @@ export function VaultView({
         reveal them.
       </p>
       {error !== null && <p role="alert">{error}</p>}
-      {notice !== null && <p className="notice">{notice}</p>}
+      <div role="status" aria-live="polite" aria-atomic="true">
+        {notice !== null && <p className="notice">{notice}</p>}
+      </div>
 
       <section>
         <h2>Projects</h2>
-        {projects === null ? (
+        {projectsLoading ? (
           <p className="muted">Loading…</p>
+        ) : (projects ?? []).length === 0 && projectsError === null ? (
+          <p className="muted">
+            No synced projects are available for this account. If you already have a local Sotto
+            project, run <code>sotto login</code> for this account and <code>sotto push</code> from
+            that project.
+          </p>
         ) : (
-          <ul className="items">
-            {projects.map((p) => (
+          <>
+            {projectsError !== null && (
+              <p>
+                <span role="alert">{projectsError}</span>{" "}
+                <button onClick={() => void loadProjects(orgKeys)}>Retry projects</button>
+              </p>
+            )}
+            <ul className="items">
+            {(projects ?? []).map((p) => (
               <li key={p.project.id}>
                 <button
                   onClick={() => void selectProject(p)}
@@ -376,26 +528,38 @@ export function VaultView({
                 </button>
               </li>
             ))}
-          </ul>
+            </ul>
+          </>
         )}
       </section>
 
       {envs !== null && (
         <section>
           <h2>Environments</h2>
-          <ul className="items">
-            {envs.map((e) => (
-              <li key={e.env.id}>
-                <button
-                  onClick={() => void selectEnv(e)}
-                  aria-current={openEnv?.envId === e.env.id ? "true" : undefined}
-                >
-                  {e.name}
-                </button>
-              </li>
-            ))}
-          </ul>
+          {envs.length === 0 ? (
+            <p className="muted">No environments are available in this project.</p>
+          ) : (
+            <ul className="items">
+              {envs.map((e) => (
+                <li key={e.env.id}>
+                  <button
+                    onClick={() => void selectEnv(e)}
+                    aria-current={openEnv?.envId === e.env.id ? "true" : undefined}
+                    aria-busy={loadingEnvId === e.env.id ? "true" : undefined}
+                  >
+                    {e.name}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
+      )}
+
+      {loadingEnvId !== null && (
+        <p role="status" aria-live="polite" className="muted">
+          Opening environment…
+        </p>
       )}
 
       {openEnv !== null && (
@@ -404,18 +568,47 @@ export function VaultView({
           {openEnv.secrets.length === 0 ? (
             <p className="muted">No secrets in this environment.</p>
           ) : (
-            <ul className="items">
-              {openEnv.secrets.map((s) => (
+            <>
+              <label>
+                Search secret names
+                <input
+                  type="search"
+                  value={secretQuery}
+                  onChange={(e) => setSecretQuery(e.target.value)}
+                  autoComplete="off"
+                />
+              </label>
+              <p
+                className="muted"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                aria-label="Secret search results"
+              >
+                {secretSearchStatus}
+              </p>
+              {filteredSecrets.length > 0 && (
+                <ul className="items">
+              {filteredSecrets.map((s) => (
                 <li key={s.entry.id}>
                   <button
+                    ref={(node) => {
+                      if (node === null) {
+                        secretButtons.current.delete(s.entry.id);
+                      } else {
+                        secretButtons.current.set(s.entry.id, node);
+                      }
+                    }}
                     onClick={() => reveal(s)}
-                    aria-current={revealed?.name === s.name ? "true" : undefined}
+                    aria-current={revealed?.id === s.entry.id ? "true" : undefined}
                   >
                     {s.name}
                   </button>
                 </li>
               ))}
-            </ul>
+                </ul>
+              )}
+            </>
           )}
           {members !== null && members.length > 0 && (
             <form
@@ -427,7 +620,11 @@ export function VaultView({
             >
               <label>
                 Share this environment with
-                <select value={shareTo} onChange={(e) => setShareTo(e.target.value)}>
+                <select
+                  value={shareTo}
+                  onChange={(e) => setShareTo(e.target.value)}
+                  disabled={sharingEnvId === openEnv.envId}
+                >
                   <option value="">- pick a member -</option>
                   {members.map((m) => (
                     <option key={m.userId} value={m.userId}>
@@ -436,8 +633,11 @@ export function VaultView({
                   ))}
                 </select>
               </label>
-              <button type="submit" disabled={shareTo === ""}>
-                Share
+              <button
+                type="submit"
+                disabled={shareTo === "" || sharingEnvId === openEnv.envId}
+              >
+                {sharingEnvId === openEnv.envId ? "Sharing…" : "Share"}
               </button>
             </form>
           )}
@@ -470,9 +670,20 @@ export function VaultView({
             rows={3}
             spellCheck={false}
           />
+          <button disabled={copyBusy} onClick={() => void copySecret(revealed)}>
+            {copyBusy ? "Copying…" : "Copy secret"}
+          </button>
+          {copyFeedback !== null && <p role="status">{copyFeedback}</p>}
+          <button className="ghost" onClick={hideRevealed}>
+            Hide secret
+          </button>
           {revealed.link === null ? (
-            <button className="ghost" onClick={() => void share(revealed)}>
-              Create one-time share link
+            <button
+              className="ghost"
+              onClick={() => void share(revealed)}
+              disabled={creatingShare}
+            >
+              {creatingShare ? "Creating…" : "Create one-time share link"}
             </button>
           ) : (
             <>

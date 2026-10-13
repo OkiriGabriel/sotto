@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { fetchShare, ShareUnavailable } from "./api";
 import { urlSafeB64ToBytes } from "./base64";
@@ -14,6 +14,15 @@ type State =
 export function RecipientPage({ token }: { token: string }) {
   const [state, setState] = useState<State>({ kind: "idle" });
   const [passphrase, setPassphrase] = useState("");
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copying" | "copied" | "failed">("idle");
+  const copyingRef = useRef(false);
+  const revealedHeadingRef = useRef<HTMLHeadingElement>(null);
+
+  useEffect(() => {
+    if (state.kind === "revealed") {
+      revealedHeadingRef.current?.focus();
+    }
+  }, [state.kind]);
 
   // Runs once per click. The fetch burns a view, so it must not run on mount or a prefetch.
   async function reveal() {
@@ -53,10 +62,31 @@ export function RecipientPage({ token }: { token: string }) {
     }
   }
 
+  async function copySecret(secret: string) {
+    if (copyingRef.current) {
+      return;
+    }
+    copyingRef.current = true;
+    setCopyStatus("copying");
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText(secret);
+      setCopyStatus("copied");
+    } catch {
+      setCopyStatus("failed");
+    } finally {
+      copyingRef.current = false;
+    }
+  }
+
   if (state.kind === "revealed") {
     return (
       <Shell>
-        <h1 id="recipient-secret-heading">Shared secret</h1>
+        <h1 id="recipient-secret-heading" ref={revealedHeadingRef} tabIndex={-1}>
+          Shared secret
+        </h1>
         <p className="muted">
           This secret has now been viewed - copy it, it may not be available again.
         </p>
@@ -68,6 +98,18 @@ export function RecipientPage({ token }: { token: string }) {
           rows={4}
           spellCheck={false}
         />
+        <button
+          className="primary"
+          type="button"
+          disabled={copyStatus === "copying"}
+          onClick={() => void copySecret(state.secret)}
+        >
+          {copyStatus === "copying" ? "Copying…" : "Copy secret"}
+        </button>
+        {copyStatus === "copied" && <p role="status">Copied to clipboard.</p>}
+        {copyStatus === "failed" && (
+          <p role="alert">Copy failed. Select the secret above and copy it manually.</p>
+        )}
       </Shell>
     );
   }

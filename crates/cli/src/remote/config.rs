@@ -28,6 +28,10 @@ pub struct GlobalConfig {
     /// Active CLI theme (e.g. "nord", "sordino", "terminal", "monochrome", "tokyo-night").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// User id from the last successful `login`, so a surprising account change warns loudly
+    /// (S-10). An opaque id, not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_id: Option<String>,
 }
 
 impl GlobalConfig {
@@ -36,7 +40,7 @@ impl GlobalConfig {
         match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text)
                 .map(Some)
-                .map_err(|e| Error::Config(e.to_string())),
+                .map_err(|e| Error::Config(format!("{}: {e}", path.display()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::Io(e.to_string())),
         }
@@ -92,7 +96,7 @@ pub fn explicit_server_url(
 pub fn web_base(config_path: &Path) -> Result<String> {
     let web = GlobalConfig::load_from(config_path)?.and_then(|c| c.web_url);
     match web
-        .map(|w| w.trim_end_matches('/').to_string())
+        .map(|w| w.trim().trim_end_matches('/').to_string())
         .filter(|w| !w.is_empty())
     {
         Some(web) => Ok(web),
@@ -112,6 +116,7 @@ mod tests {
             server_url: Some("https://api.sotto.dev".into()),
             web_url: Some("https://app.sotto.dev".into()),
             theme: None,
+            last_user_id: Some("user-1".into()),
         };
         config.save_to(&path).unwrap();
         assert_eq!(GlobalConfig::load_from(&path).unwrap().unwrap(), config);
@@ -123,6 +128,30 @@ mod tests {
         assert!(GlobalConfig::load_from(&dir.path().join("nope.toml"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn parse_error_names_path_with_spaces() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("global config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let broken = "theme = [\n";
+        std::fs::write(&path, broken).unwrap();
+
+        let error = GlobalConfig::load_from(&path).unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        let rendered = error.to_string();
+        let path_text = path.display().to_string();
+        assert!(
+            matches!(error, Error::Config(message) if message.contains(&path_text)),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("TOML parse error at line 1, column 11"),
+            "{rendered}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
     }
 
     #[test]
@@ -140,6 +169,18 @@ mod tests {
             Some("https://b".into())
         );
         assert_eq!(
+            resolve(
+                None,
+                Some("  https://b.example///  ".into()),
+                Some("https://c".into())
+            ),
+            Some("https://b.example".into())
+        );
+        assert_eq!(
+            resolve(None, Some("   ".into()), Some("https://c/".into())),
+            Some("https://c".into())
+        );
+        assert_eq!(
             resolve(None, None, Some("https://c".into())),
             Some("https://c".into())
         );
@@ -148,6 +189,34 @@ mod tests {
             resolve(Some(""), None, Some("https://c".into())),
             Some("https://c".into())
         );
+    }
+
+    #[test]
+    fn web_base_normalizes_configured_url_and_falls_back_when_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let save = |web_url: Option<&str>| {
+            GlobalConfig {
+                server_url: Some("https://api.example.test".into()),
+                web_url: web_url.map(str::to_owned),
+                theme: None,
+                last_user_id: None,
+            }
+            .save_to(&path)
+            .unwrap();
+        };
+
+        save(Some("  https://web.example.test///  "));
+        assert_eq!(web_base(&path).unwrap(), "https://web.example.test");
+
+        save(Some("   "));
+        assert_eq!(web_base(&path).unwrap(), "https://api.example.test");
+
+        save(Some(""));
+        assert_eq!(web_base(&path).unwrap(), "https://api.example.test");
+
+        save(Some("https://web.example.test"));
+        assert_eq!(web_base(&path).unwrap(), "https://web.example.test");
     }
 
     #[test]
@@ -167,6 +236,7 @@ mod tests {
             server_url: Some("https://self.hosted".into()),
             web_url: None,
             theme: None,
+            last_user_id: None,
         }
         .save_to(&path)
         .unwrap();
