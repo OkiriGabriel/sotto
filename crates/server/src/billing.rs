@@ -46,8 +46,9 @@ use crate::cloud_provider_stripe::{
 use crate::cloud_provider_stripe_event_repair::StripeEventRepairDisposition;
 use crate::cloud_provider_stripe_http::{AuthenticatedStripeEvent, StripeReadClient};
 use crate::cloud_provider_stripe_sponsored::{
-    compose_sponsored_coverage, SponsoredAllocationInterval, SponsoredAllocationManifest,
-    SponsoredCoverageResult, SponsoredStripeCoverageConfig,
+    compose_sponsored_coverage, sponsored_predecessor_evidence_reference,
+    SponsoredAllocationInterval, SponsoredAllocationManifest, SponsoredCoverageResult,
+    SponsoredStripeCoverageConfig,
 };
 use crate::cloud_provider_stripe_sponsored_store::{
     end_sponsored_allocation, record_sponsored_allocation_term,
@@ -5156,6 +5157,15 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     } else {
         None
     };
+    let sponsored_renewal_failure = if event.kind == "invoice.payment_failed"
+        && billing.personal_coverage_ingest_enabled()
+        && sponsored_billing_enabled()
+        && !accepted_failure_duplicate
+    {
+        Some(prepare_sponsored_renewal_failure(&state.pool, billing, &body, &event).await?)
+    } else {
+        None
+    };
     let sponsored_coverage = if event.kind == "invoice.paid"
         && billing.personal_coverage_ingest_enabled()
         && sponsored_billing_enabled()
@@ -5239,9 +5249,17 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         }
         if let Some(failure) = personal_renewal_failure.as_ref() {
             accept_prepared_personal_renewal_failure(&mut tx, failure).await?;
-            if let Some(subscription_id) = subscription_id {
-                update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
-            }
+            mark_webhook_event_processed(&mut tx, &event.id).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        if let Some(failure) = sponsored_renewal_failure.as_ref() {
+            apply_sponsored_renewal_failure(
+                &mut tx,
+                failure,
+                crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
+            )
+            .await?;
             mark_webhook_event_processed(&mut tx, &event.id).await?;
             tx.commit().await?;
             return Ok(());
@@ -5368,6 +5386,14 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                 if let Some(failure) = personal_renewal_failure.as_ref() {
                     accept_prepared_personal_renewal_failure(&mut tx, failure).await?;
                 }
+                if let Some(failure) = sponsored_renewal_failure.as_ref() {
+                    apply_sponsored_renewal_failure(
+                        &mut tx,
+                        failure,
+                        crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
+                    )
+                    .await?;
+                }
             }
             _ => {}
         },
@@ -5375,8 +5401,10 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             return Err(Error::Config("invalid webhook disposition".into()));
         }
     }
-    if let Some(subscription_id) = subscription_id {
-        update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+    if event_updates_subscription_watermark(&event) {
+        if let Some(subscription_id) = subscription_id {
+            update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+        }
     }
     mark_webhook_event_processed(&mut tx, &event.id).await?;
     tx.commit().await?;
@@ -5653,6 +5681,23 @@ pub(crate) async fn repair_authenticated_stripe_event(
         return Ok(StripeEventRepairDisposition::AlreadyApplied);
     }
     if event.kind == "invoice.payment_failed" {
+        if sponsored_billing_enabled() {
+            let sponsored: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM billing_sponsored_subscriptions WHERE provider_subscription_id = $1)",
+            )
+            .bind(invoice_subscription_id_claim(&event.data.object).unwrap_or_default())
+            .fetch_one(pool)
+            .await?;
+            if sponsored {
+                return repair_authenticated_sponsored_renewal_failure(
+                    pool,
+                    billing,
+                    authenticated,
+                    &event,
+                )
+                .await;
+            }
+        }
         return repair_authenticated_personal_renewal_failure(
             pool,
             billing,
@@ -5984,11 +6029,12 @@ async fn repair_authenticated_personal_renewal_failure(
         subscription_id,
     )
     .await?;
-    crate::cloud_provider_stripe_renewal_store::accept_personal_renewal_failure(
+    crate::cloud_provider_stripe_renewal_store::accept_personal_renewal_failure_with_provenance(
         &mut tx,
         &context,
         &allocation,
         &evidence,
+        crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::AuthenticatedApiRead,
         true,
     )
     .await
@@ -5996,6 +6042,42 @@ async fn repair_authenticated_personal_renewal_failure(
     mark_webhook_event_processed(&mut tx, evidence.event_id()).await?;
     tx.commit().await?;
     Ok(StripeEventRepairDisposition::Applied)
+}
+
+async fn repair_authenticated_sponsored_renewal_failure(
+    pool: &PgPool,
+    billing: &BillingState,
+    authenticated: &AuthenticatedStripeEvent,
+    event: &Event,
+) -> Result<StripeEventRepairDisposition> {
+    let raw_event = serde_json::to_string(authenticated.payload())
+        .map_err(|_| Error::BadRequest("malformed authenticated Stripe event".into()))?;
+    let prepared = prepare_sponsored_renewal_failure(pool, billing, &raw_event, event).await?;
+    if matches!(&prepared, SponsoredRenewalFailurePreparation::NotApplicable) {
+        return Ok(StripeEventRepairDisposition::Unrelated);
+    }
+    let rejection = match &prepared {
+        SponsoredRenewalFailurePreparation::Rejected { reason, .. } => Some(*reason),
+        _ => None,
+    };
+    let subscription_id = invoice_subscription_id_claim(&event.data.object);
+    let mut tx = pool.begin().await?;
+    if let Some(subscription_id) = subscription_id.as_deref() {
+        lock_subscription(&mut tx, subscription_id).await?;
+    }
+    record_webhook_receipt(&mut tx, event, subscription_id.as_deref()).await?;
+    apply_sponsored_renewal_failure(
+        &mut tx,
+        &prepared,
+        crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::AuthenticatedApiRead,
+    )
+    .await?;
+    mark_webhook_event_processed(&mut tx, &event.id).await?;
+    tx.commit().await?;
+    Ok(rejection.map_or(
+        StripeEventRepairDisposition::Applied,
+        StripeEventRepairDisposition::Rejected,
+    ))
 }
 
 struct PreparedPersonalInvoiceCoverage {
@@ -6025,6 +6107,61 @@ struct PreparedPersonalRenewalFailure {
     context: ProviderContext,
     allocation: VerifiedAllocation,
     evidence: crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence,
+}
+
+struct PreparedSponsoredRenewalFailure {
+    context: ProviderContext,
+    event: crate::cloud_provider::VerifiedProviderEvent,
+    organization_id: String,
+    subscription_id: String,
+    invoice_id: String,
+    affected: Vec<(
+        VerifiedAllocation,
+        crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence,
+    )>,
+}
+
+enum SponsoredRenewalFailurePreparation {
+    NotApplicable,
+    Prepared(Box<PreparedSponsoredRenewalFailure>),
+    Rejected {
+        context: ProviderContext,
+        event: Box<crate::cloud_provider::VerifiedProviderEvent>,
+        organization_id: String,
+        subscription_id: String,
+        invoice_id: String,
+        period_start: i64,
+        reason: &'static str,
+    },
+}
+
+struct SponsoredFailurePredecessor {
+    settlement: crate::cloud_provider_stripe_sponsored::SponsoredInvoiceSettlement,
+    manifest: SponsoredAllocationManifest,
+}
+
+fn sponsored_invoice_lines_can_be_predecessors(
+    predecessor_lines: &[crate::cloud_provider_stripe_http::StripeInvoiceLineResource],
+    failed_lines: &[crate::cloud_provider_stripe_http::StripeInvoiceLineResource],
+) -> bool {
+    failed_lines.iter().any(|failed_line| {
+        let (Some(item_id), Some(price_id), Some(start)) = (
+            failed_line.subscription_item_id.as_deref(),
+            failed_line.price_id.as_deref(),
+            failed_line.period_start,
+        ) else {
+            return false;
+        };
+        predecessor_lines.iter().any(|line| {
+            (line
+                .subscription_item_id
+                .as_deref()
+                .or(line.legacy_subscription_item_id.as_deref())
+                == Some(item_id))
+                && line.price_id.as_deref() == Some(price_id)
+                && line.period_end == Some(start)
+        })
+    })
 }
 
 async fn prepare_signed_personal_renewal_failure(
@@ -6162,6 +6299,639 @@ async fn accept_prepared_personal_renewal_failure(
     Ok(())
 }
 
+/// Read and link one grouped sponsor failure before opening the webhook transaction. Stripe reads
+/// are bounded and all local manifests are loaded independently, so no database lock is held
+/// across the network boundary. An incomplete historical chain is retained as a fixed rejection
+/// outcome rather than a partial set of beneficiary evidence.
+async fn prepare_sponsored_renewal_failure(
+    pool: &PgPool,
+    billing: &BillingState,
+    raw_event: &str,
+    event: &Event,
+) -> Result<SponsoredRenewalFailurePreparation> {
+    let Some((personal_config, stripe)) = billing.personal_coverage() else {
+        return Ok(SponsoredRenewalFailurePreparation::NotApplicable);
+    };
+    let Some(catalogue) = billing.price_catalogue() else {
+        return Ok(SponsoredRenewalFailurePreparation::NotApplicable);
+    };
+    let invoice = &event.data.object;
+    let (Some(invoice_id), Some(subscription_id), Some(customer_id)) = (
+        invoice.get("id").and_then(stripe_reference),
+        invoice_subscription_id_claim(invoice),
+        invoice.get("customer").and_then(stripe_reference),
+    ) else {
+        return Ok(SponsoredRenewalFailurePreparation::NotApplicable);
+    };
+    let subscription = sqlx::query(
+        "SELECT organization_id, provider_customer_id FROM billing_sponsored_subscriptions \
+         WHERE provider_subscription_id = $1",
+    )
+    .bind(&subscription_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(subscription) = subscription else {
+        return Ok(SponsoredRenewalFailurePreparation::NotApplicable);
+    };
+    let organization_id: String = subscription.try_get("organization_id")?;
+    if subscription
+        .try_get::<Option<String>, _>("provider_customer_id")?
+        .as_deref()
+        != Some(customer_id.as_str())
+    {
+        let context = personal_config
+            .provider_context()
+            .map_err(|_| Error::Internal("Stripe provider context is invalid".into()))?;
+        let identity = sponsored_verified_event(event, raw_event, &subscription_id, &invoice_id)?;
+        return Ok(SponsoredRenewalFailurePreparation::Rejected {
+            context,
+            event: Box::new(identity),
+            organization_id,
+            subscription_id,
+            invoice_id,
+            period_start: invoice_period_start(invoice).unwrap_or(event.created),
+            reason: "sponsored_renewal_binding_mismatch",
+        });
+    }
+    let context = personal_config
+        .provider_context()
+        .map_err(|_| Error::Internal("Stripe provider context is invalid".into()))?;
+    let sponsored_config = SponsoredStripeCoverageConfig::new(
+        personal_config.account_id.clone(),
+        personal_config.environment,
+        catalogue.standard_monthly.clone(),
+        catalogue.standard_annual.clone(),
+        catalogue.founding_monthly.clone(),
+        catalogue.founding_annual.clone(),
+    )
+    .map_err(|_| Error::Internal("sponsored Stripe coverage prices are invalid".into()))?;
+
+    let mut session = stripe.session();
+    let failure_result = stripe
+        .sponsored_failure_invoice(&mut session, &invoice_id, &customer_id, &subscription_id)
+        .await;
+    let (failure_invoice, failed_lines) = match failure_result {
+        Ok(Some(result)) => result,
+        Ok(None) => return Ok(SponsoredRenewalFailurePreparation::NotApplicable),
+        Err(error) if error.is_evidence_rejection() => {
+            return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                context,
+                event: Box::new(sponsored_verified_event(
+                    event,
+                    raw_event,
+                    &subscription_id,
+                    &invoice_id,
+                )?),
+                organization_id,
+                subscription_id,
+                invoice_id,
+                period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                reason: "sponsored_renewal_invoice_unusable",
+            });
+        }
+        Err(_) => {
+            return Err(Error::Internal(
+                "sponsored renewal invoice read failed".into(),
+            ));
+        }
+    };
+    if failure_invoice.id != invoice_id || failed_lines.is_empty() {
+        return Err(Error::Internal(
+            "sponsored renewal invoice identity changed".into(),
+        ));
+    }
+    let invoices = stripe
+        .subscription_invoices_bounded(&mut session, &subscription_id, Some(&customer_id), 64)
+        .await
+        .map_err(|_| Error::Internal("sponsored renewal history read failed".into()))?;
+    let mut predecessors = Vec::new();
+    for paid_invoice in invoices
+        .iter()
+        .filter(|invoice| invoice.status.as_deref() == Some("paid"))
+    {
+        let predecessor_lines = if paid_invoice.lines_complete {
+            paid_invoice.line_summaries.clone()
+        } else {
+            match stripe.invoice_lines(&mut session, &paid_invoice.id).await {
+                Ok(lines) => lines,
+                Err(error) if error.is_evidence_rejection() => {
+                    return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                        context,
+                        event: Box::new(sponsored_verified_event(
+                            event,
+                            raw_event,
+                            &subscription_id,
+                            &invoice_id,
+                        )?),
+                        organization_id,
+                        subscription_id: subscription_id.clone(),
+                        invoice_id,
+                        period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                        reason: "sponsored_renewal_history_unusable",
+                    });
+                }
+                Err(_) => {
+                    return Err(Error::Internal(
+                        "sponsored renewal history read failed".into(),
+                    ));
+                }
+            }
+        };
+        let could_be_predecessor =
+            sponsored_invoice_lines_can_be_predecessors(&predecessor_lines, &failed_lines);
+        if !could_be_predecessor {
+            continue;
+        }
+        let settlement = match stripe
+            .sponsored_invoice_settlement(
+                &mut session,
+                &paid_invoice.id,
+                &customer_id,
+                &subscription_id,
+                &sponsored_config,
+            )
+            .await
+        {
+            Ok(settlement) => settlement,
+            Err(error) if error.is_evidence_rejection() => {
+                return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                    context,
+                    event: Box::new(sponsored_verified_event(
+                        event,
+                        raw_event,
+                        &subscription_id,
+                        &invoice_id,
+                    )?),
+                    organization_id,
+                    subscription_id: subscription_id.clone(),
+                    invoice_id,
+                    period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                    reason: "sponsored_renewal_history_unusable",
+                });
+            }
+            Err(_) => {
+                return Err(Error::Internal(
+                    "sponsored renewal settlement read failed".into(),
+                ));
+            }
+        };
+        let manifest =
+            match crate::cloud_provider_stripe_sponsored_store::load_sponsored_allocation_manifest(
+                pool,
+                &context,
+                &customer_id,
+                &subscription_id,
+                settlement.period_start(),
+                settlement.period_end(),
+                crate::cloud_provider_stripe_sponsored_store::SponsoredManifestLoadLimits::default(
+                ),
+            )
+            .await
+            {
+                Ok(manifest) => manifest,
+                Err(crate::cloud_provider_stripe_sponsored_store::SponsoredManifestLoadError::Database(_)) => {
+                    return Err(Error::Internal(
+                        "sponsored renewal manifest read failed".into(),
+                    ));
+                }
+                Err(_) => {
+                    return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                        context,
+                        event: Box::new(sponsored_verified_event(
+                            event,
+                            raw_event,
+                            &subscription_id,
+                            &invoice_id,
+                        )?),
+                        organization_id,
+                        subscription_id: subscription_id.clone(),
+                        invoice_id,
+                        period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                        reason: "sponsored_renewal_manifest_unusable",
+                    });
+                }
+            };
+        match compose_sponsored_coverage(&sponsored_config, &manifest, &settlement) {
+            Ok(SponsoredCoverageResult::Candidate(_)) => {
+                predecessors.push(SponsoredFailurePredecessor {
+                    settlement,
+                    manifest,
+                })
+            }
+            _ => {
+                return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                    context,
+                    event: Box::new(sponsored_verified_event(
+                        event,
+                        raw_event,
+                        &subscription_id,
+                        &invoice_id,
+                    )?),
+                    organization_id,
+                    subscription_id: subscription_id.clone(),
+                    invoice_id,
+                    period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                    reason: "sponsored_renewal_predecessor_unusable",
+                });
+            }
+        }
+    }
+
+    let mut affected = Vec::new();
+    let mut used = std::collections::BTreeSet::new();
+    let mut rejected_reason = None;
+    let mut notice_period_start = i64::MAX;
+    for failed_line in &failed_lines {
+        let (Some(item_id), Some(price_id), Some(start), Some(end), Some(line_id)) = (
+            failed_line.subscription_item_id.as_deref(),
+            failed_line.price_id.as_deref(),
+            failed_line.period_start,
+            failed_line.period_end,
+            Some(failed_line.id.as_str()),
+        ) else {
+            rejected_reason = Some("sponsored_renewal_line_incomplete");
+            break;
+        };
+        notice_period_start = notice_period_start.min(start);
+        let Some(interval) = sponsored_config.stripe_interval_for_price(price_id) else {
+            rejected_reason = Some("sponsored_renewal_price_unsupported");
+            break;
+        };
+        let matches = predecessors
+            .iter()
+            .filter(|predecessor| {
+                predecessor.settlement.lines().iter().any(|line| {
+                    line.provider_item_id() == item_id
+                        && line.price_id() == price_id
+                        && line.period_end() == start
+                })
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            rejected_reason = Some("sponsored_renewal_predecessor_missing_or_ambiguous");
+            break;
+        }
+        let predecessor = matches[0];
+        let predecessor_line = predecessor
+            .settlement
+            .lines()
+            .iter()
+            .find(|line| {
+                line.provider_item_id() == item_id
+                    && line.price_id() == price_id
+                    && line.period_end() == start
+            })
+            .expect("matched predecessor line exists");
+        let failure_manifest =
+            match crate::cloud_provider_stripe_sponsored_store::load_sponsored_allocation_manifest(
+                pool,
+                &context,
+                &customer_id,
+                &subscription_id,
+                start,
+                end,
+                crate::cloud_provider_stripe_sponsored_store::SponsoredManifestLoadLimits::default(
+                ),
+            )
+            .await
+            {
+                Ok(manifest) => manifest,
+                Err(crate::cloud_provider_stripe_sponsored_store::SponsoredManifestLoadError::Database(_)) => {
+                    return Err(Error::Internal(
+                        "sponsored renewal manifest read failed".into(),
+                    ));
+                }
+                Err(_) => {
+                    rejected_reason = Some("sponsored_renewal_manifest_unusable");
+                    break;
+                }
+            };
+        let continuing = failure_manifest
+            .allocations()
+            .iter()
+            .filter(|allocation| {
+                allocation.provider_item_id() == item_id
+                    && allocation.price_id() == price_id
+                    && allocation.effective_from() <= start
+                    && allocation
+                        .effective_until()
+                        .is_none_or(|until| until >= end)
+            })
+            .collect::<Vec<_>>();
+        if failed_line.quantity.is_none_or(|quantity| quantity <= 0)
+            || continuing.len() as i64 != failed_line.quantity.unwrap_or_default()
+        {
+            rejected_reason = Some("sponsored_renewal_quantity_mismatch");
+            break;
+        }
+        let predecessor_reference = sponsored_predecessor_evidence_reference(
+            &predecessor.manifest,
+            &predecessor.settlement,
+        );
+        for current in continuing {
+            let old = predecessor
+                .manifest
+                .allocations()
+                .iter()
+                .find(|allocation| {
+                    allocation.allocation_reference() == current.allocation_reference()
+                        && allocation.source_id() == current.source_id()
+                        && allocation.beneficiary_id() == current.beneficiary_id()
+                        && allocation.provider_item_id() == item_id
+                        && allocation.price_id() == price_id
+                        && allocation.effective_from() <= predecessor.settlement.period_start()
+                        && allocation
+                            .effective_until()
+                            .is_none_or(|until| until >= predecessor.settlement.period_end())
+                });
+            let Some(_) = old else { continue };
+            let allocation = match load_sponsored_failure_allocation(
+                pool,
+                &context,
+                &customer_id,
+                &subscription_id,
+                current.allocation_reference(),
+                current.source_id(),
+                current.beneficiary_id(),
+                item_id,
+            )
+            .await
+            {
+                Ok(Some(allocation)) => allocation,
+                Ok(None) => {
+                    rejected_reason = Some("sponsored_renewal_allocation_unusable");
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if !used.insert((allocation.allocation_id.clone(), line_id.to_owned())) {
+                rejected_reason = Some("sponsored_renewal_line_ambiguous");
+                break;
+            }
+            let evidence = crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence::from_sponsored_parts(
+                &event.id,
+                &invoice_id,
+                line_id,
+                predecessor.settlement.invoice_id(),
+                &predecessor_reference,
+                &context.account_id,
+                context.environment,
+                current.allocation_reference(),
+                &customer_id,
+                &subscription_id,
+                item_id,
+                price_id,
+                predecessor_line.period_start(),
+                predecessor_line.period_end(),
+                start,
+                end,
+                event.created,
+                interval,
+            )
+            .map_err(|_| Error::Internal("sponsored renewal evidence is invalid".into()))?;
+            affected.push((allocation, evidence));
+            if affected.len() > 128 {
+                rejected_reason = Some("sponsored_renewal_scope_exceeded");
+                break;
+            }
+        }
+        if rejected_reason.is_some() {
+            break;
+        }
+    }
+    let period_start = if notice_period_start == i64::MAX {
+        invoice_period_start(invoice).unwrap_or(event.created)
+    } else {
+        notice_period_start
+    };
+    if let Some(reason) = rejected_reason.or_else(|| {
+        affected
+            .is_empty()
+            .then_some("sponsored_renewal_no_continuing_allocations")
+    }) {
+        return Ok(SponsoredRenewalFailurePreparation::Rejected {
+            context,
+            event: Box::new(sponsored_verified_event(
+                event,
+                raw_event,
+                &subscription_id,
+                &invoice_id,
+            )?),
+            organization_id,
+            subscription_id,
+            invoice_id,
+            period_start,
+            reason,
+        });
+    }
+    let verified_event = affected[0]
+        .1
+        .verified_event()
+        .map_err(|_| Error::Internal("sponsored renewal event identity is invalid".into()))?;
+    Ok(SponsoredRenewalFailurePreparation::Prepared(Box::new(
+        PreparedSponsoredRenewalFailure {
+            context,
+            event: verified_event,
+            organization_id,
+            subscription_id,
+            invoice_id,
+            affected,
+        },
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_sponsored_failure_allocation(
+    pool: &PgPool,
+    context: &ProviderContext,
+    customer_id: &str,
+    subscription_id: &str,
+    allocation_reference: &str,
+    source_id: &str,
+    beneficiary_id: &str,
+    item_id: &str,
+) -> Result<Option<VerifiedAllocation>> {
+    let row = sqlx::query(
+        "SELECT allocation.allocation_id, allocation.payer_id, allocation.beneficiary_id, \
+                allocation.provider_subscription_id, allocation.provider_item_id, \
+                allocation.external_allocation_reference, allocation.coverage_source_id, \
+                allocation.effective_from, allocation.effective_until, allocation.state, \
+                allocation.ownership_evidence_reference, allocation.provider_account_id, \
+                allocation.provider_environment, payer.provider_customer_id, payer.payer_kind \
+         FROM cloud_provider_allocations allocation \
+         JOIN cloud_provider_payers payer ON payer.payer_id = allocation.payer_id \
+         WHERE allocation.provider_namespace = $1 AND allocation.provider_account_id = $2 \
+           AND allocation.provider_environment = $3 \
+           AND allocation.provider_subscription_id = $4 AND allocation.provider_item_id = $5 \
+           AND allocation.external_allocation_reference = $6 \
+           AND allocation.coverage_source_id = $7 AND allocation.beneficiary_id = $8",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(subscription_id)
+    .bind(item_id)
+    .bind(allocation_reference)
+    .bind(source_id)
+    .bind(beneficiary_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    if row.try_get::<String, _>("payer_kind")? != "sponsor"
+        || row.try_get::<String, _>("provider_customer_id")? != customer_id
+        || row.try_get::<String, _>("provider_account_id")? != context.account_id
+        || row.try_get::<String, _>("provider_environment")? != context.environment.as_str()
+    {
+        return Ok(None);
+    }
+    let allocation = VerifiedAllocation::new(
+        row.try_get::<String, _>("allocation_id")?,
+        row.try_get::<String, _>("payer_id")?,
+        customer_id.to_owned(),
+        ProviderPayerKind::Sponsor,
+        beneficiary_id.to_owned(),
+        subscription_id.to_owned(),
+        item_id.to_owned(),
+        allocation_reference.to_owned(),
+        source_id.to_owned(),
+        row.try_get::<i64, _>("effective_from")?,
+        row.try_get::<Option<i64>, _>("effective_until")?,
+        parse_allocation_state(&row.try_get::<String, _>("state")?)?,
+        row.try_get::<String, _>("ownership_evidence_reference")?,
+    )
+    .map_err(|_| Error::Internal("stored sponsored allocation is invalid".into()))?;
+    Ok(Some(allocation))
+}
+
+async fn apply_sponsored_renewal_failure(
+    tx: &mut Transaction<'_, Postgres>,
+    preparation: &SponsoredRenewalFailurePreparation,
+    provenance: crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance,
+) -> Result<()> {
+    // Callers hold the subscription advisory lock before reaching this point. A paid invoice may
+    // have committed after Stripe preparation observed the failed invoice as open; its durable
+    // processed receipt is authoritative and prevents late failure evidence from reviving it.
+    let paid_invoice = match preparation {
+        SponsoredRenewalFailurePreparation::Prepared(prepared) => {
+            Some((&prepared.subscription_id, &prepared.invoice_id))
+        }
+        SponsoredRenewalFailurePreparation::Rejected {
+            subscription_id,
+            invoice_id,
+            ..
+        } => Some((subscription_id, invoice_id)),
+        SponsoredRenewalFailurePreparation::NotApplicable => None,
+    };
+    if let Some((subscription_id, invoice_id)) = paid_invoice {
+        if sponsored_renewal_paid_receipt_exists(tx, subscription_id, invoice_id).await? {
+            return Ok(());
+        }
+    }
+    match preparation {
+        SponsoredRenewalFailurePreparation::NotApplicable => {}
+        SponsoredRenewalFailurePreparation::Prepared(prepared) => {
+            sqlx::query(
+                "UPDATE billing_sponsored_subscriptions SET status = 'past_due', updated_at = now() \
+                 WHERE organization_id = $1 AND provider_subscription_id = $2",
+            )
+            .bind(&prepared.organization_id)
+            .bind(&prepared.subscription_id)
+            .execute(&mut **tx)
+            .await?;
+            for (allocation, evidence) in &prepared.affected {
+                crate::cloud_provider_stripe_renewal_store::accept_sponsored_renewal_failure(
+                    tx,
+                    &prepared.context,
+                    allocation,
+                    evidence,
+                    &prepared.event,
+                    provenance,
+                    true,
+                )
+                .await
+                .map_err(|_| {
+                    Error::Internal("sponsored renewal evidence could not be recorded".into())
+                })?;
+                enqueue_sponsored_renewal_failure_notices(
+                    tx,
+                    &prepared.organization_id,
+                    &prepared.invoice_id,
+                    &allocation.beneficiary_id,
+                    evidence.predecessor_period_end(),
+                    false,
+                )
+                .await?;
+            }
+            let period_start = prepared
+                .affected
+                .first()
+                .map(|(_, evidence)| evidence.predecessor_period_end())
+                .ok_or_else(|| Error::Internal("sponsored renewal has no affected seats".into()))?;
+            enqueue_sponsored_renewal_failure_notices(
+                tx,
+                &prepared.organization_id,
+                &prepared.invoice_id,
+                "",
+                period_start,
+                true,
+            )
+            .await?;
+        }
+        SponsoredRenewalFailurePreparation::Rejected {
+            context,
+            event,
+            organization_id,
+            subscription_id,
+            invoice_id,
+            period_start,
+            reason,
+        } => {
+            reject_verified_event(tx, context, event, reason)
+                .await
+                .map_err(|_| {
+                    Error::Internal("sponsored renewal rejection could not be recorded".into())
+                })?;
+            sqlx::query(
+                "UPDATE billing_sponsored_subscriptions SET status = 'past_due', updated_at = now() \
+                 WHERE organization_id = $1 AND provider_subscription_id = $2",
+            )
+            .bind(organization_id)
+            .bind(subscription_id)
+            .execute(&mut **tx)
+            .await?;
+            enqueue_sponsored_renewal_failure_notices(
+                tx,
+                organization_id,
+                invoice_id,
+                "",
+                *period_start,
+                true,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn sponsored_renewal_paid_receipt_exists(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: &str,
+    invoice_id: &str,
+) -> Result<bool> {
+    if subscription_id.is_empty() || invoice_id.trim().is_empty() {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM stripe_webhook_events \
+         WHERE event_type = 'invoice.paid' AND subscription_id = $1 \
+           AND provider_object_id = $2 AND processed_at IS NOT NULL)",
+    )
+    .bind(subscription_id)
+    .bind(invoice_id)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 struct PreparedSponsoredInvoiceSeat {
     seat_id: String,
     operation_id: String,
@@ -6178,6 +6948,7 @@ struct PreparedSponsoredInvoiceCoverage {
     context: ProviderContext,
     event: crate::cloud_provider::VerifiedProviderEvent,
     organization_id: String,
+    invoice_id: String,
     payment_reference: String,
     period_start: i64,
     period_end: i64,
@@ -6557,6 +7328,7 @@ async fn prepare_sponsored_invoice_coverage(
             context,
             event,
             organization_id,
+            invoice_id,
             payment_reference,
             period_start,
             period_end,
@@ -7549,9 +8321,181 @@ async fn enqueue_personal_renewal_recovered_notice(
     Ok(())
 }
 
+async fn enqueue_sponsored_renewal_failure_notices(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    invoice_id: &str,
+    beneficiary_id: &str,
+    period_start: i64,
+    include_administrators: bool,
+) -> Result<()> {
+    let deadline = period_start
+        .checked_add(crate::cloud_coverage::RENEWAL_RECOVERY_SECONDS)
+        .ok_or_else(|| Error::Internal("sponsored recovery deadline overflowed".into()))?;
+    let due_at_epoch: i64 = sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
+        .fetch_one(&mut **tx)
+        .await?;
+    let event_key = opaque_provider_id("sponsored-renewal-v1", &[organization_id, invoice_id]);
+    if !beneficiary_id.is_empty() {
+        let intent = crate::notifications::NoticeIntent {
+            recipient_user_id: beneficiary_id.to_owned(),
+            event_key: event_key.clone(),
+            policy_key: "sponsored-renewal-failure-v1".into(),
+            kind: crate::notifications::NoticeKind::SponsoredRenewalFailure,
+            channel: crate::notifications::NoticeChannel::InApp,
+            contact_id: None,
+            due_at_epoch,
+            content: crate::notifications::NoticeContent {
+                title: "Your sponsored Cloud renewal needs attention".into(),
+                detail: "Your organisation’s Cloud renewal payment was unsuccessful. Ask an organisation billing admin to review the payment before the recovery deadline.".into(),
+                effective_at_epoch: Some(period_start),
+                deadline_epoch: Some(deadline),
+                amount_pence: None,
+            },
+        };
+        crate::notifications::enqueue_in_tx(tx, &intent)
+            .await
+            .map_err(notification_error)?;
+    }
+    if !include_administrators {
+        return Ok(());
+    }
+    let administrators: Vec<String> = sqlx::query_scalar(
+        "SELECT membership.user_id FROM organization_memberships membership \
+         JOIN organizations organization ON organization.id = membership.org_id \
+         WHERE membership.org_id = $1 AND membership.role IN ('owner','admin') \
+           AND organization.lifecycle_state = 'active' \
+         ORDER BY membership.user_id COLLATE \"C\" LIMIT 129",
+    )
+    .bind(organization_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if administrators.len() > 128 {
+        return Err(Error::Internal(
+            "sponsored renewal administrator scope exceeded".into(),
+        ));
+    }
+    for administrator in administrators {
+        let intent = crate::notifications::NoticeIntent {
+            recipient_user_id: administrator,
+            event_key: event_key.clone(),
+            policy_key: "sponsored-renewal-action-v1".into(),
+            kind: crate::notifications::NoticeKind::SponsoredRenewalAction,
+            channel: crate::notifications::NoticeChannel::InApp,
+            contact_id: None,
+            due_at_epoch,
+            content: crate::notifications::NoticeContent {
+                title: "Organisation Cloud renewal needs attention".into(),
+                detail: "The organisation’s sponsored Cloud renewal payment was unsuccessful. Review the organisation billing panel before the recovery deadline.".into(),
+                effective_at_epoch: Some(period_start),
+                deadline_epoch: Some(deadline),
+                amount_pence: None,
+            },
+        };
+        crate::notifications::enqueue_in_tx(tx, &intent)
+            .await
+            .map_err(notification_error)?;
+    }
+    Ok(())
+}
+
+/// Resolve only failures for this exact paid invoice. Notice cancellation, resolution rows and
+/// replacement notices share the billing transaction, so a retry cannot leave contradictory UI.
+async fn resolve_sponsored_renewal_failures(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    subscription_id: &str,
+    invoice_id: &str,
+    event_created: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO cloud_provider_stripe_renewal_resolutions \
+         (provider_namespace, provider_account_id, provider_environment, event_id, \
+          beneficiary_id, allocation_id, resolution_invoice_id) \
+         SELECT failure.provider_namespace, failure.provider_account_id, \
+                failure.provider_environment, failure.event_id, failure.beneficiary_id, \
+                failure.allocation_id, $2 \
+         FROM cloud_provider_stripe_renewal_failures failure \
+         JOIN cloud_provider_allocations allocation ON allocation.allocation_id = failure.allocation_id \
+         JOIN cloud_provider_payers payer ON payer.payer_id = allocation.payer_id \
+         WHERE failure.provider_namespace = 'stripe' AND failure.subscription_id = $1 \
+           AND failure.invoice_id = $2 AND payer.payer_kind = 'sponsor' \
+           AND NOT EXISTS (SELECT 1 FROM cloud_provider_stripe_renewal_resolutions resolution \
+                           WHERE resolution.provider_namespace = failure.provider_namespace \
+                             AND resolution.provider_account_id = failure.provider_account_id \
+                             AND resolution.provider_environment = failure.provider_environment \
+                             AND resolution.event_id = failure.event_id \
+                             AND resolution.beneficiary_id = failure.beneficiary_id \
+                             AND resolution.allocation_id = failure.allocation_id) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(subscription_id)
+    .bind(invoice_id)
+    .execute(&mut **tx)
+    .await?;
+    let event_key = opaque_provider_id("sponsored-renewal-v1", &[organization_id, invoice_id]);
+    let due_at_epoch: i64 = sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
+        .fetch_one(&mut **tx)
+        .await?;
+    let notices = sqlx::query(
+        "SELECT DISTINCT recipient_user_id COLLATE \"C\" AS recipient_user_id, kind \
+         FROM cloud_notice_outbox \
+         WHERE event_key = $1 AND kind IN ('sponsored_renewal_failure','sponsored_renewal_action') \
+           AND policy_key IN ('sponsored-renewal-failure-v1','sponsored-renewal-action-v1') \
+         ORDER BY recipient_user_id COLLATE \"C\" LIMIT 257",
+    )
+    .bind(&event_key)
+    .fetch_all(&mut **tx)
+    .await?;
+    if notices.len() > 256 {
+        return Err(Error::Internal(
+            "sponsored renewal notice scope exceeded".into(),
+        ));
+    }
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='cancelled', cancelled_at=now(), \
+             lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
+         WHERE event_key=$1 AND kind IN ('sponsored_renewal_failure','sponsored_renewal_action') \
+           AND policy_key IN ('sponsored-renewal-failure-v1','sponsored-renewal-action-v1') \
+           AND status <> 'cancelled'",
+    )
+    .bind(&event_key)
+    .execute(&mut **tx)
+    .await?;
+    for row in notices {
+        let recipient: String = row.try_get("recipient_user_id")?;
+        let was_admin = row.try_get::<String, _>("kind")? == "sponsored_renewal_action";
+        let intent = crate::notifications::NoticeIntent {
+            recipient_user_id: recipient,
+            event_key: event_key.clone(),
+            policy_key: if was_admin {
+                "sponsored-renewal-recovered-admin-v1".into()
+            } else {
+                "sponsored-renewal-recovered-v1".into()
+            },
+            kind: crate::notifications::NoticeKind::RecoveryResolved,
+            channel: crate::notifications::NoticeChannel::InApp,
+            contact_id: None,
+            due_at_epoch,
+            content: crate::notifications::NoticeContent {
+                title: "Organisation Cloud renewal recovered".into(),
+                detail: "The organisation’s sponsored Cloud renewal payment was received. The matching renewal warning has been resolved.".into(),
+                effective_at_epoch: Some(event_created.max(0)),
+                deadline_epoch: None,
+                amount_pence: None,
+            },
+        };
+        crate::notifications::enqueue_in_tx(tx, &intent)
+            .await
+            .map_err(notification_error)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventDisposition {
-    /// The event is newer than the stored watermark and can apply its payload normally.
+    /// The event can apply normally: either it is newer than the watermark or it is a
+    /// payment fact whose ordering is guarded by the subscription lock instead.
     Apply,
     /// The event ties the watermark timestamp and must reconcile against Stripe's current state.
     Reconcile,
@@ -7589,6 +8533,12 @@ async fn record_webhook_event(
     if event.kind == "invoice.paid" {
         return Ok(EventDisposition::Apply);
     }
+    // A failed invoice is a payment fact, not a subscription-state observation. Keep it under
+    // the subscription lock for paid-versus-failed ordering, but let the corresponding
+    // customer.subscription.updated event own the watermark and status transition.
+    if event.kind == "invoice.payment_failed" {
+        return Ok(EventDisposition::Apply);
+    }
 
     let Some(subscription_id) = subscription_id else {
         return Ok(EventDisposition::Apply);
@@ -7621,14 +8571,19 @@ async fn record_webhook_receipt(
 ) -> Result<bool> {
     let inserted = sqlx::query(
         "INSERT INTO stripe_webhook_events \
-         (event_id, event_type, api_version, stripe_created, subscription_id) \
-         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+         (event_id, event_type, api_version, stripe_created, subscription_id, provider_object_id) \
+         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (event_id) DO NOTHING",
     )
     .bind(&event.id)
     .bind(&event.kind)
     .bind(event.api_version.as_deref().unwrap_or("missing"))
     .bind(event.created)
     .bind(subscription_id)
+    .bind(
+        event.data.object["id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty()),
+    )
     .execute(&mut **tx)
     .await?
     .rows_affected()
@@ -7711,10 +8666,16 @@ async fn complete_repaired_invoice_event(
     tx: &mut Transaction<'_, Postgres>,
     event: &Event,
 ) -> Result<()> {
-    if let Some(subscription_id) = event_subscription_id(event) {
-        update_subscription_watermark(tx, event, &subscription_id).await?;
+    if event_updates_subscription_watermark(event) {
+        if let Some(subscription_id) = event_subscription_id(event) {
+            update_subscription_watermark(tx, event, &subscription_id).await?;
+        }
     }
     mark_webhook_event_processed(tx, &event.id).await
+}
+
+fn event_updates_subscription_watermark(event: &Event) -> bool {
+    event.kind != "invoice.payment_failed"
 }
 
 fn event_subscription_id(event: &Event) -> Option<String> {
@@ -7725,6 +8686,7 @@ fn event_subscription_id(event: &Event) -> Option<String> {
                 .map(str::to_string)
         }
         "invoice.paid" => invoice_subscription_id(&event.data.object).map(str::to_string),
+        "invoice.payment_failed" => invoice_subscription_id_claim(&event.data.object),
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             event.data.object["id"].as_str().map(str::to_string)
         }
@@ -8655,6 +9617,14 @@ async fn invoice_paid(
             match verified_sponsored_invoice {
                 Some(SponsoredInvoiceCoveragePreparation::Prepared(prepared)) => {
                     accept_sponsored_invoice_coverage(tx, prepared).await?;
+                    resolve_sponsored_renewal_failures(
+                        tx,
+                        &prepared.organization_id,
+                        subscription_id,
+                        &prepared.invoice_id,
+                        event_created,
+                    )
+                    .await?;
                 }
                 Some(SponsoredInvoiceCoveragePreparation::Rejected {
                     context,
@@ -10324,6 +11294,459 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sponsored_failure_fanout_and_resolution_cover_bounded_recipients() {
+        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+        let options =
+            sqlx::postgres::PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
+        assert!(
+            matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+            "refusing to write test fixtures to non-local database: {}",
+            options.get_host()
+        );
+        let pool = crate::db::connect(&database_url)
+            .await
+            .expect("connect test database");
+        crate::db::migrate(&pool)
+            .await
+            .expect("migrate test database");
+
+        let fixture = Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct_sponsor_failure_{fixture}");
+        let customer_id = format!("cus_sponsor_failure_{fixture}");
+        let subscription_id = format!("sub_sponsor_failure_{fixture}");
+        let organization_id = format!("sponsor_failure_org_{fixture}");
+        let administrator_id = format!("sponsor_failure_admin_{fixture}");
+        let additional_administrator_ids = (0..127)
+            .map(|index| format!("sponsor_failure_admin_{fixture}_{index}"))
+            .collect::<Vec<_>>();
+        let beneficiary_ids = (0..128)
+            .map(|index| format!("sponsor_failure_beneficiary_{fixture}_{index}"))
+            .collect::<Vec<_>>();
+        let event_ids = [
+            format!("evt_sponsor_failure_a_{fixture}"),
+            format!("evt_sponsor_failure_b_{fixture}"),
+        ];
+        let invoice_id = format!("in_sponsor_failure_{fixture}");
+        let payer_id = format!("payer_sponsor_failure_{fixture}");
+        let context = ProviderContext::new("stripe", &account_id, ProviderEnvironment::Test)
+            .expect("valid sponsor provider context");
+
+        for user_id in std::iter::once(&administrator_id)
+            .chain(additional_administrator_ids.iter())
+            .chain(beneficiary_ids.iter())
+        {
+            sqlx::query(
+                "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, $2, $1)",
+            )
+            .bind(user_id)
+            .bind(format!("sponsor-failure-{fixture}"))
+            .execute(&pool)
+            .await
+            .expect("insert test user");
+        }
+        sqlx::query("INSERT INTO organizations (id, enc_name, tier) VALUES ($1, $2, 'free')")
+            .bind(&organization_id)
+            .bind(b"opaque".as_slice())
+            .execute(&pool)
+            .await
+            .expect("insert sponsor organisation");
+        for (administrator, role) in std::iter::once((&administrator_id, "owner"))
+            .chain(additional_administrator_ids.iter().map(|id| (id, "admin")))
+        {
+            sqlx::query(
+                "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, $3)",
+            )
+            .bind(&organization_id)
+            .bind(administrator)
+            .bind(role)
+            .execute(&pool)
+            .await
+            .expect("insert sponsor administrator");
+        }
+        sqlx::query(
+            "INSERT INTO billing_sponsored_subscriptions \
+             (organization_id, provider_customer_id, provider_subscription_id, status) \
+             VALUES ($1, $2, $3, 'active')",
+        )
+        .bind(&organization_id)
+        .bind(&customer_id)
+        .bind(&subscription_id)
+        .execute(&pool)
+        .await
+        .expect("insert sponsored subscription");
+
+        let mut allocations = Vec::new();
+        let mut evidence_by_event = [Vec::new(), Vec::new()];
+        for (index, beneficiary_id) in beneficiary_ids.iter().enumerate() {
+            let allocation_reference = format!("alloc_sponsor_failure_{fixture}_{index}");
+            let allocation = VerifiedAllocation::new(
+                format!("allocation_sponsor_failure_{fixture}_{index}"),
+                &payer_id,
+                &customer_id,
+                ProviderPayerKind::Sponsor,
+                beneficiary_id,
+                &subscription_id,
+                "si_sponsor_monthly",
+                &allocation_reference,
+                format!("source_sponsor_failure_{fixture}_{index}"),
+                1_000,
+                None,
+                AllocationState::Active,
+                format!("stripe:sponsor-failure-owner:{fixture}:{index}"),
+            )
+            .expect("valid sponsored allocation");
+            allocations.push(allocation);
+            for event_index in 0..event_ids.len() {
+                evidence_by_event[event_index].push(
+                    crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence::from_sponsored_parts(
+                        &event_ids[event_index],
+                        &invoice_id,
+                        &format!("il_sponsor_failure_{fixture}_{event_index}_{index}"),
+                        &format!("in_sponsor_paid_{fixture}"),
+                        &format!("stripe:sponsor-predecessor:{fixture}"),
+                        &account_id,
+                        ProviderEnvironment::Test,
+                        &allocation_reference,
+                        &customer_id,
+                        &subscription_id,
+                        "si_sponsor_monthly",
+                        "price_sponsor_monthly",
+                        1_000,
+                        2_000,
+                        2_000,
+                        3_000,
+                        2_100 + event_index as i64,
+                        crate::cloud_provider_stripe::StripeInterval::Month,
+                    )
+                    .expect("valid sponsored failure evidence"),
+                );
+            }
+        }
+        let mut registration = pool.begin().await.expect("begin allocation registration");
+        for allocation in &allocations {
+            register_verified_allocation(&mut registration, &context, allocation)
+                .await
+                .expect("register sponsored allocation");
+        }
+        registration
+            .commit()
+            .await
+            .expect("commit allocation registration");
+
+        let event = evidence_by_event[0][0]
+            .verified_event()
+            .expect("invoice wide event identity");
+        assert_eq!(
+            event.normalized_payload_hash,
+            evidence_by_event[0][127]
+                .verified_event()
+                .expect("second invoice wide event identity")
+                .normalized_payload_hash
+        );
+        let preparation = SponsoredRenewalFailurePreparation::Prepared(Box::new(
+            PreparedSponsoredRenewalFailure {
+                context: context.clone(),
+                event,
+                organization_id: organization_id.clone(),
+                subscription_id: subscription_id.clone(),
+                invoice_id: invoice_id.clone(),
+                affected: allocations
+                    .iter()
+                    .cloned()
+                    .zip(evidence_by_event[0].clone())
+                    .collect(),
+            },
+        ));
+        let second_preparation = SponsoredRenewalFailurePreparation::Prepared(Box::new(
+            PreparedSponsoredRenewalFailure {
+                context: context.clone(),
+                event: evidence_by_event[1][0]
+                    .verified_event()
+                    .expect("second shared invoice event identity"),
+                organization_id: organization_id.clone(),
+                subscription_id: subscription_id.clone(),
+                invoice_id: invoice_id.clone(),
+                affected: allocations
+                    .iter()
+                    .cloned()
+                    .zip(evidence_by_event[1].clone())
+                    .collect(),
+            },
+        ));
+        for preparation in [&preparation, &second_preparation] {
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin grouped failure transaction");
+            apply_sponsored_renewal_failure(
+                &mut tx,
+                preparation,
+                crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
+            )
+            .await
+            .expect("accept every beneficiary failure atomically");
+            tx.commit().await.expect("commit grouped failure");
+        }
+
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_provider_stripe_renewal_failures WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("count per allocation failures");
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("count shared event receipts");
+        let notice_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_notice_outbox WHERE event_key = $1 \
+             AND kind IN ('sponsored_renewal_failure','sponsored_renewal_action')",
+        )
+        .bind(opaque_provider_id(
+            "sponsored-renewal-v1",
+            &[&organization_id, &invoice_id],
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("count beneficiary and administrator notices");
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM billing_sponsored_subscriptions WHERE organization_id = $1",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await
+        .expect("sponsored subscription status");
+        assert_eq!(failures, 256);
+        assert_eq!(receipts, 2);
+        assert_eq!(notice_count, 256);
+        assert_eq!(status, "past_due");
+
+        let event_key =
+            opaque_provider_id("sponsored-renewal-v1", &[&organization_id, &invoice_id]);
+        let mut resolution = pool
+            .begin()
+            .await
+            .expect("begin matching paid invoice resolution");
+        resolve_sponsored_renewal_failures(
+            &mut resolution,
+            &organization_id,
+            &subscription_id,
+            &invoice_id,
+            2_500,
+        )
+        .await
+        .expect("resolve only the matching sponsored invoice");
+        resolution
+            .commit()
+            .await
+            .expect("commit matching invoice resolution");
+        let resolutions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_provider_stripe_renewal_resolutions WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("count resolved beneficiary evidence");
+        let recovered_notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_notice_outbox WHERE event_key = $1 \
+             AND kind = 'recovery_resolved' AND status = 'pending'",
+        )
+        .bind(&event_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count recovery notices");
+        let failure_notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_notice_outbox WHERE event_key = $1 \
+             AND kind IN ('sponsored_renewal_failure','sponsored_renewal_action') \
+             AND status = 'cancelled'",
+        )
+        .bind(&event_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count retired failure notices");
+        assert_eq!(resolutions, 256);
+        assert_eq!(recovered_notices, 256);
+        assert_eq!(failure_notices, 256);
+
+        let paid_event = Event {
+            id: format!("evt_sponsor_paid_{fixture}"),
+            created: 2_600,
+            api_version: Some("2026-07-29.dahlia".into()),
+            kind: "invoice.paid".into(),
+            data: EventData {
+                object: serde_json::json!({
+                    "id": invoice_id,
+                    "subscription": subscription_id,
+                }),
+            },
+        };
+        let mut paid_receipt = pool.begin().await.expect("begin paid invoice receipt");
+        record_webhook_receipt(&mut paid_receipt, &paid_event, Some(&subscription_id))
+            .await
+            .expect("record exact paid invoice identity");
+        mark_webhook_event_processed(&mut paid_receipt, &paid_event.id)
+            .await
+            .expect("mark paid invoice receipt complete");
+        paid_receipt
+            .commit()
+            .await
+            .expect("commit paid invoice receipt");
+        sqlx::query(
+            "UPDATE billing_sponsored_subscriptions SET status = 'active' WHERE organization_id = $1",
+        )
+        .bind(&organization_id)
+        .execute(&pool)
+        .await
+        .expect("reflect the later paid invoice");
+        let mut late_failure = pool.begin().await.expect("begin late failure replay");
+        let late_failure_event = Event {
+            id: event_ids[0].clone(),
+            created: 2_100,
+            api_version: Some("2026-07-29.dahlia".into()),
+            kind: "invoice.payment_failed".into(),
+            data: EventData {
+                object: serde_json::json!({
+                    "id": invoice_id,
+                    "subscription": subscription_id,
+                }),
+            },
+        };
+        assert_eq!(
+            record_webhook_event(&mut late_failure, &late_failure_event)
+                .await
+                .expect("failure receipt takes the subscription lock"),
+            EventDisposition::Apply
+        );
+        apply_sponsored_renewal_failure(
+            &mut late_failure,
+            &preparation,
+            crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
+        )
+        .await
+        .expect("processed paid invoice suppresses stale failure");
+        late_failure
+            .commit()
+            .await
+            .expect("commit ignored late failure");
+        let failure_receipt: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT subscription_id, provider_object_id FROM stripe_webhook_events WHERE event_id = $1",
+        )
+        .bind(&late_failure_event.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load failure receipt identity");
+        assert_eq!(failure_receipt.0.as_deref(), Some(subscription_id.as_str()));
+        assert_eq!(failure_receipt.1.as_deref(), Some(invoice_id.as_str()));
+        let status_after_late_failure: String = sqlx::query_scalar(
+            "SELECT status FROM billing_sponsored_subscriptions WHERE organization_id = $1",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await
+        .expect("subscription remains current after late failure");
+        assert_eq!(status_after_late_failure, "active");
+
+        sqlx::query("DELETE FROM cloud_notice_outbox WHERE event_key = $1")
+            .bind(event_key)
+            .execute(&pool)
+            .await
+            .expect("remove test notices");
+        sqlx::query(
+            "DELETE FROM cloud_provider_stripe_renewal_resolutions WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .execute(&pool)
+        .await
+        .expect("remove test resolutions");
+        sqlx::query("DELETE FROM cloud_provider_stripe_renewal_failures WHERE event_id = ANY($1)")
+            .bind(event_ids.to_vec())
+            .execute(&pool)
+            .await
+            .expect("remove test evidence");
+        sqlx::query(
+            "DELETE FROM cloud_provider_invalidation_associations WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .execute(&pool)
+        .await
+        .expect("remove test invalidations");
+        sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = ANY($1)")
+            .bind(event_ids.to_vec())
+            .execute(&pool)
+            .await
+            .expect("remove test event receipt");
+        sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+            .bind(&paid_event.id)
+            .execute(&pool)
+            .await
+            .expect("remove paid webhook receipt");
+        for allocation_index in 0..beneficiary_ids.len() {
+            let allocation_id = format!("allocation_sponsor_failure_{fixture}_{allocation_index}");
+            let source_id = format!("source_sponsor_failure_{fixture}_{allocation_index}");
+            sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+                .bind(allocation_id)
+                .execute(&pool)
+                .await
+                .expect("remove test allocation");
+            sqlx::query("DELETE FROM cloud_coverage_sources WHERE source_id = $1")
+                .bind(source_id)
+                .execute(&pool)
+                .await
+                .expect("remove test source");
+        }
+        sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = ANY($1)")
+            .bind(beneficiary_ids.to_vec())
+            .execute(&pool)
+            .await
+            .expect("remove test coordinators");
+        sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
+            .bind(&payer_id)
+            .execute(&pool)
+            .await
+            .expect("remove test payer");
+        sqlx::query("DELETE FROM billing_sponsored_subscriptions WHERE organization_id = $1")
+            .bind(&organization_id)
+            .execute(&pool)
+            .await
+            .expect("remove test sponsored subscription");
+        for table in [
+            "cloud_coverage_heads",
+            "cloud_coverage_revision_facts",
+            "cloud_coverage_revisions",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE beneficiary_id = ANY($1)"
+            ))
+            .bind(beneficiary_ids.to_vec())
+            .execute(&pool)
+            .await
+            .expect("remove test coverage projections");
+        }
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(&organization_id)
+            .execute(&pool)
+            .await
+            .expect("remove test organisation");
+        for user_id in std::iter::once(&administrator_id)
+            .chain(additional_administrator_ids.iter())
+            .chain(beneficiary_ids.iter())
+        {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("remove test user");
+        }
+    }
+
+    #[tokio::test]
     async fn transfer_invoice_webhook_ignores_later_renewals_and_reviews_wrong_boundary_start() {
         if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
             return;
@@ -11877,6 +13300,31 @@ mod tests {
     }
 
     #[test]
+    fn invoice_payment_failed_events_use_the_subscription_from_the_invoice_parent() {
+        let event = Event {
+            id: "evt_failed_1".into(),
+            created: 1_800_000_000,
+            api_version: Some("2026-07-29.dahlia".into()),
+            kind: "invoice.payment_failed".into(),
+            data: EventData {
+                object: serde_json::json!({
+                    "id": "in_failed_1",
+                    "parent": {
+                        "type": "subscription_details",
+                        "subscription_details": {"subscription": {"id": "sub_failed_1"}}
+                    }
+                }),
+            },
+        };
+
+        assert_eq!(
+            event_subscription_id(&event).as_deref(),
+            Some("sub_failed_1")
+        );
+        assert!(!event_updates_subscription_watermark(&event));
+    }
+
+    #[test]
     fn sponsored_transfer_period_preview_uses_stripe_line_boundaries() {
         let at = |year, month, day, hour| {
             FoundingDate::new(year, month, day)
@@ -12040,5 +13488,78 @@ mod tests {
             sponsored_invoice_items(&invoice),
             vec![("si-sponsored".into(), "price-sponsored".into(), 3)]
         );
+    }
+
+    #[test]
+    fn sponsored_history_reads_only_invoices_with_a_contiguous_item_price_line() {
+        let line = |item: &str, price: &str, start, end| {
+            crate::cloud_provider_stripe_http::StripeInvoiceLineResource {
+                id: "il_test".into(),
+                quantity: Some(1),
+                subscription_id: Some("sub_test".into()),
+                subscription_item_id: Some(item.into()),
+                legacy_subscription_id: None,
+                legacy_subscription_item_id: None,
+                price_id: Some(price.into()),
+                allocation_reference: None,
+                parent_type: Some("subscription_item_details".into()),
+                pricing_type: Some("price_details".into()),
+                livemode: Some(false),
+                period_start: Some(start),
+                period_end: Some(end),
+                invoice_id: Some("in_test".into()),
+                proration: Some(false),
+            }
+        };
+        let failed = [line("si_month", "price_month", 200, 300)];
+        assert!(sponsored_invoice_lines_can_be_predecessors(
+            &[line("si_month", "price_month", 100, 200)],
+            &failed,
+        ));
+        assert!(!sponsored_invoice_lines_can_be_predecessors(
+            &[line("si_year", "price_year", 100, 200)],
+            &failed,
+        ));
+        assert!(!sponsored_invoice_lines_can_be_predecessors(
+            &[line("si_month", "price_month", 100, 199)],
+            &failed,
+        ));
+    }
+
+    #[test]
+    fn sponsored_failure_only_rejects_permanent_evidence_errors() {
+        use crate::cloud_provider_stripe_http::StripeReadError;
+
+        assert!(StripeReadError::MalformedResponse("invoice.status").is_evidence_rejection());
+        assert!(StripeReadError::Observation(
+            crate::cloud_provider_stripe::StripeContractError::ContextMismatch
+        )
+        .is_evidence_rejection());
+        assert!(StripeReadError::Settlement(
+            crate::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(
+                "ambiguous payment"
+            )
+        )
+        .is_evidence_rejection());
+
+        let operational = [
+            StripeReadError::Authentication { status: 401 },
+            StripeReadError::Permission { status: 403 },
+            StripeReadError::ContextMismatch,
+            StripeReadError::SessionClientMismatch,
+            StripeReadError::Transport,
+            StripeReadError::Timeout,
+            StripeReadError::RateLimited {
+                retry_after: Some(std::time::Duration::from_secs(1)),
+            },
+            StripeReadError::Retryable { status: 503 },
+            StripeReadError::RequestBoundExceeded,
+            StripeReadError::PageBoundExceeded,
+            StripeReadError::RecordBoundExceeded,
+            StripeReadError::SessionBytesExceeded,
+        ];
+        assert!(operational
+            .iter()
+            .all(|error| !error.is_evidence_rejection()));
     }
 }

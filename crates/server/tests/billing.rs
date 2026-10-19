@@ -1510,23 +1510,28 @@ async fn personal_renewal_notices_follow_signed_failure_and_matching_paid_invoic
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM stripe_subscription_watermarks WHERE subscription_id=$1")
-        .bind(&subscription_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    let webhook_event_ids = vec![
+        first_failure_event,
+        retry_failure_event,
+        mismatch_failure_event,
+        unbound_failure_event,
+        unrelated_paid_event,
+        recovered_paid_event,
+        paid_before_failure_event,
+        late_failure_event,
+        format!("evt_paid_after_cancel_{fixture}"),
+    ];
+    sqlx::query(
+        "DELETE FROM stripe_subscription_watermarks \
+         WHERE subscription_id=$1 OR event_id = ANY($2)",
+    )
+    .bind(&subscription_id)
+    .bind(&webhook_event_ids)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
-        .bind(vec![
-            first_failure_event,
-            retry_failure_event,
-            mismatch_failure_event,
-            unbound_failure_event,
-            unrelated_paid_event,
-            recovered_paid_event,
-            paid_before_failure_event,
-            late_failure_event,
-            format!("evt_paid_after_cancel_{fixture}"),
-        ])
+        .bind(&webhook_event_ids)
         .execute(&pool)
         .await
         .unwrap();
@@ -2623,8 +2628,29 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
     let payer_id = format!("payer_renewal_{fixture}");
     let source_id = format!("source_renewal_{fixture}");
     let event_id = format!("evt_renewal_{fixture}");
+    let update_event_id = format!("evt_zz_subscription_updated_{fixture}");
     let invoice_id = format!("in_failed_{fixture}");
     seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("renewal-failure-{fixture}")).await;
+    let paid_through = 172_800;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state='active', stripe_customer_id=$2, \
+           stripe_subscription_id=$3, paid_through_epoch=$4, paid_through_date=$5 \
+         WHERE user_id=$1",
+    )
+    .bind(&user_id)
+    .bind(&customer_id)
+    .bind(&subscription_id)
+    .bind(paid_through)
+    .bind(
+        FoundingDate::from_unix_seconds(paid_through)
+            .unwrap()
+            .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("activate the personal renewal notice fixture");
 
     let coverage = StripeCoverageConfig::new(
         &account_id,
@@ -2679,7 +2705,7 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
             "subscription":subscription_id, "subscription_item":"si_renewal", "proration":false
         }},
         "pricing":{"type":"price_details", "price_details":{"price":"price_renewal_month"}},
-        "period":{"start":1_000, "end":2_000}
+        "period":{"start":86_400, "end":172_800}
     });
     let failed_line = serde_json::json!({
         "id":format!("il_failed_{fixture}"), "invoice":invoice_id, "quantity":1, "livemode":false,
@@ -2687,10 +2713,10 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
             "subscription":subscription_id, "subscription_item":"si_renewal", "proration":false
         }},
         "pricing":{"type":"price_details", "price_details":{"price":"price_renewal_month"}},
-        "period":{"start":2_000, "end":3_000}
+        "period":{"start":172_800, "end":259_200}
     });
     let event_payload = serde_json::json!({
-        "id":event_id, "created":3_000, "api_version":STRIPE_API_VERSION,
+        "id":event_id, "created":259_200, "api_version":STRIPE_API_VERSION,
         "type":"invoice.payment_failed", "livemode":false,
         "data":{"object":{
             "object":"invoice", "id":invoice_id, "customer":customer_id,
@@ -2747,6 +2773,34 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
         sotto_server::config::DeploymentMode::Cloud,
     );
 
+    // Subscription state owns the watermark even when it arrives before the payment failure.
+    // Use the same Stripe timestamp and a lexically higher event id to pin the delivery order
+    // that previously caused the failure evidence and customer notice to be dropped.
+    let subscription_update = serde_json::json!({
+        "id": update_event_id,
+        "created": 259_200,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "livemode": false,
+        "data": {"object": {
+            "object": "subscription",
+            "id": subscription_id,
+            "status": "past_due",
+            "cancel_at_period_end": false,
+            "metadata": {"personal_user_id": user_id, "operation_id": operation_id}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &subscription_update,
+            Some(&stripe_signature(&subscription_update))
+        )
+        .await,
+        StatusCode::OK
+    );
+
     assert_eq!(
         post_webhook(
             &app,
@@ -2764,6 +2818,22 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
     .await
     .expect("query directly accepted failure evidence");
     assert_eq!(accepted, 1);
+    let failure_notice_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND kind='failed_renewal'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query the notice committed for the failure event");
+    assert_eq!(failure_notice_count, 1);
+    let watermark_event_id: String = sqlx::query_scalar(
+        "SELECT event_id FROM stripe_subscription_watermarks WHERE subscription_id=$1",
+    )
+    .bind(&subscription_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query the subscription state watermark");
+    assert_eq!(watermark_event_id, update_event_id);
     let processed: bool = sqlx::query_scalar(
         "SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id = $1",
     )
@@ -2813,6 +2883,26 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
         .unwrap();
     sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
         .bind(&event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+        .bind(&update_event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_notice_outbox WHERE recipient_user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id=$1")
+        .bind(&operation_id)
         .execute(&pool)
         .await
         .unwrap();
